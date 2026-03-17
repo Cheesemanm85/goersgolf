@@ -1,6 +1,5 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import crypto from "node:crypto";
+import { getSupabase } from "@/lib/supabase";
 
 export type UserRecord = {
   id: string;
@@ -11,44 +10,54 @@ export type UserRecord = {
   createdAt: string;
 };
 
-function usersFilePath() {
-  return path.join(process.cwd(), "data", "users.json");
-}
+type DbUser = {
+  id: string;
+  username: string;
+  password_hash: string;
+  email: string | null;
+  balance: number | null;
+  created_at: string;
+};
 
-async function readAllUsers(): Promise<UserRecord[]> {
-  const file = usersFilePath();
-  try {
-    const raw = await fs.readFile(file, "utf8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as UserRecord[]) : [];
-  } catch (e: unknown) {
-    if (typeof e === "object" && e && "code" in e && e.code === "ENOENT") {
-      return [];
-    }
-    throw e;
-  }
-}
-
-async function writeAllUsers(users: UserRecord[]) {
-  const file = usersFilePath();
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(users, null, 2) + "\n", "utf8");
+function rowToUser(r: DbUser): UserRecord {
+  return {
+    id: r.id,
+    username: r.username,
+    passwordHash: r.password_hash,
+    email: r.email ?? undefined,
+    balance: r.balance ?? undefined,
+    createdAt: r.created_at,
+  };
 }
 
 export async function findUserByUsername(username: string) {
-  const users = await readAllUsers();
-  return users.find((u) => u.username.toLowerCase() === username.toLowerCase());
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("users")
+    .select("*")
+    .ilike("username", username.trim())
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? rowToUser(data as DbUser) : null;
 }
 
 export async function findUserByEmail(email: string) {
-  const users = await readAllUsers();
   const norm = email.trim().toLowerCase();
-  return users.find((u) => (u.email ?? "").trim().toLowerCase() === norm);
+  if (!norm) return null;
+  const supabase = getSupabase();
+  const { data, error } = await supabase.from("users").select("*");
+  if (error) throw error;
+  const users = (data ?? []) as DbUser[];
+  const found = users.find((u) => (u.email ?? "").trim().toLowerCase() === norm);
+  return found ? rowToUser(found) : null;
 }
 
 export async function findUserById(id: string) {
-  const users = await readAllUsers();
-  return users.find((u) => u.id === id);
+  const supabase = getSupabase();
+  const { data, error } = await supabase.from("users").select("*").eq("id", id).maybeSingle();
+  if (error) throw error;
+  return data ? rowToUser(data as DbUser) : null;
 }
 
 export async function createUser(input: {
@@ -56,61 +65,87 @@ export async function createUser(input: {
   passwordHash: string;
   email: string;
 }) {
-  const users = await readAllUsers();
-  const existing = users.find(
-    (u) => u.username.toLowerCase() === input.username.toLowerCase(),
-  );
-  if (existing) {
-    return { ok: false as const, error: "USERNAME_TAKEN" as const };
+  const supabase = getSupabase();
+  const email = input.email.trim().toLowerCase();
+
+  const { data: existingByUsername } = await supabase
+    .from("users")
+    .select("id")
+    .ilike("username", input.username.trim())
+    .limit(1)
+    .maybeSingle();
+  if (existingByUsername) return { ok: false as const, error: "USERNAME_TAKEN" as const };
+
+  if (email) {
+    const { data: all } = await supabase.from("users").select("email");
+    const emailTaken = (all ?? []).some(
+      (r: { email: string | null }) => (r.email ?? "").trim().toLowerCase() === email,
+    );
+    if (emailTaken) return { ok: false as const, error: "EMAIL_TAKEN" as const };
   }
 
-  const email = input.email.trim().toLowerCase();
-  const emailTaken = users.find((u) => (u.email ?? "").trim().toLowerCase() === email);
-  if (emailTaken) return { ok: false as const, error: "EMAIL_TAKEN" as const };
-
-  const user: UserRecord = {
+  const row: Omit<DbUser, "id" | "created_at"> & { id?: string; created_at?: string } = {
     id: crypto.randomUUID(),
-    username: input.username,
-    passwordHash: input.passwordHash,
+    username: input.username.trim(),
+    password_hash: input.passwordHash,
     email,
     balance: 0,
-    createdAt: new Date().toISOString(),
+    created_at: new Date().toISOString(),
   };
-  users.push(user);
-  await writeAllUsers(users);
-  return { ok: true as const, user };
+  const { data: inserted, error } = await supabase.from("users").insert(row).select("*").single();
+  if (error) throw error;
+  return { ok: true as const, user: rowToUser(inserted as DbUser) };
 }
 
 export async function updateUserById(
   id: string,
   patch: Partial<Pick<UserRecord, "username" | "passwordHash" | "email" | "balance">>,
 ) {
-  const users = await readAllUsers();
-  const idx = users.findIndex((u) => u.id === id);
-  if (idx === -1) return { ok: false as const, error: "USER_NOT_FOUND" as const };
+  const supabase = getSupabase();
+  const { data: existing, error: fetchError } = await supabase
+    .from("users")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (fetchError) throw fetchError;
+  if (!existing) return { ok: false as const, error: "USER_NOT_FOUND" as const };
 
-  const nextUsername = patch.username ?? users[idx]!.username;
-  const conflict = users.find(
-    (u) => u.id !== id && u.username.toLowerCase() === nextUsername.toLowerCase(),
-  );
-  if (conflict) return { ok: false as const, error: "USERNAME_TAKEN" as const };
-
-  const nextEmailRaw = patch.email ?? users[idx]!.email ?? "";
+  const current = existing as DbUser;
+  const nextUsername = (patch.username ?? current.username).trim();
+  const nextEmailRaw = patch.email !== undefined ? patch.email : current.email ?? "";
   const nextEmail = nextEmailRaw.trim().toLowerCase();
-  if (nextEmail) {
-    const emailConflict = users.find(
-      (u) => u.id !== id && (u.email ?? "").trim().toLowerCase() === nextEmail,
+
+  if (nextUsername.toLowerCase() !== current.username.toLowerCase()) {
+    const { data: conflict } = await supabase
+      .from("users")
+      .select("id")
+      .ilike("username", nextUsername)
+      .limit(1)
+      .maybeSingle();
+    if (conflict) return { ok: false as const, error: "USERNAME_TAKEN" as const };
+  }
+
+  if (nextEmail && nextEmail !== (current.email ?? "").trim().toLowerCase()) {
+    const { data: all } = await supabase.from("users").select("id, email");
+    const emailConflict = (all ?? []).some(
+      (r: { id: string; email: string | null }) =>
+        r.id !== id && (r.email ?? "").trim().toLowerCase() === nextEmail,
     );
     if (emailConflict) return { ok: false as const, error: "EMAIL_TAKEN" as const };
   }
 
-  const updated: UserRecord = {
-    ...users[idx]!,
-    ...patch,
-    email: nextEmailRaw,
-  };
-  users[idx] = updated;
-  await writeAllUsers(users);
-  return { ok: true as const, user: updated };
-}
+  const updatePayload: Partial<DbUser> = {};
+  if (patch.username !== undefined) updatePayload.username = patch.username.trim();
+  if (patch.passwordHash !== undefined) updatePayload.password_hash = patch.passwordHash;
+  if (patch.email !== undefined) updatePayload.email = nextEmailRaw || null;
+  if (patch.balance !== undefined) updatePayload.balance = patch.balance;
 
+  const { data: updated, error: updateError } = await supabase
+    .from("users")
+    .update(updatePayload)
+    .eq("id", id)
+    .select("*")
+    .single();
+  if (updateError) throw updateError;
+  return { ok: true as const, user: rowToUser(updated as DbUser) };
+}

@@ -1,6 +1,5 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import crypto from "node:crypto";
+import { getSupabase } from "@/lib/supabase";
 import type { MajorKey } from "@/lib/majors";
 
 export type TeamRecord = {
@@ -17,84 +16,106 @@ export type TeamRecord = {
     inRank: number;
     inName: string;
     inPlayerId?: string;
-    afterRound: number; // 1-4, substitute applies from (afterRound+1)
+    afterRound: number;
     madeAt: string;
   } | null;
   createdAt: string;
 };
 
-function teamsFilePath() {
-  return path.join(process.cwd(), "data", "teams.json");
+type DbTeam = {
+  id: string;
+  user_id: string;
+  major_key: string;
+  name: string;
+  golfers: { rank: number; name: string; playerId?: string }[];
+  captain_rank: number | null;
+  substitute: TeamRecord["substitute"];
+  created_at: string;
+};
+
+const MAJOR_KEYS: MajorKey[] = ["masters", "pga", "usopen", "open"];
+
+function toMajorKey(s: string): MajorKey {
+  return MAJOR_KEYS.includes(s as MajorKey) ? (s as MajorKey) : "masters";
 }
 
-async function readAllTeams(): Promise<TeamRecord[]> {
-  const file = teamsFilePath();
-  try {
-    const raw = await fs.readFile(file, "utf8");
-    const parsed = JSON.parse(raw);
-    const rows = Array.isArray(parsed) ? (parsed as any[]) : [];
-    // Back-compat: old records didn't have majorKey; treat them as Masters picks.
-    return rows
-      .map((t) => ({
-        ...t,
-        majorKey:
-          t?.majorKey === "masters" || t?.majorKey === "pga" || t?.majorKey === "usopen" || t?.majorKey === "open"
-            ? (t.majorKey as MajorKey)
-            : ("masters" as MajorKey),
-        substitute: t?.substitute ?? null,
-      }))
-      .filter((t) => typeof t.userId === "string" && typeof t.name === "string") as TeamRecord[];
-  } catch (e: unknown) {
-    if (typeof e === "object" && e && "code" in e && e.code === "ENOENT") {
-      return [];
-    }
-    throw e;
-  }
-}
-
-async function writeAllTeams(teams: TeamRecord[]) {
-  const file = teamsFilePath();
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(teams, null, 2) + "\n", "utf8");
+function rowToTeam(r: DbTeam): TeamRecord {
+  return {
+    id: r.id,
+    userId: r.user_id,
+    majorKey: toMajorKey(r.major_key),
+    name: r.name,
+    golfers: Array.isArray(r.golfers) ? r.golfers : [],
+    captainRank: r.captain_rank ?? null,
+    substitute: r.substitute ?? null,
+    createdAt: r.created_at,
+  };
 }
 
 export async function getTeamForUser(userId: string) {
-  const teams = await readAllTeams();
-  return teams.find((t) => t.userId === userId && t.majorKey === "masters") ?? null;
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("fantasy_teams")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("major_key", "masters")
+    .maybeSingle();
+  if (error) throw error;
+  return data ? rowToTeam(data as DbTeam) : null;
 }
 
 export async function getTeamForUserMajor(userId: string, majorKey: MajorKey) {
-  const teams = await readAllTeams();
-  return teams.find((t) => t.userId === userId && t.majorKey === majorKey) ?? null;
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("fantasy_teams")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("major_key", majorKey)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? rowToTeam(data as DbTeam) : null;
 }
 
 export async function getAllTeams() {
-  return readAllTeams();
+  const supabase = getSupabase();
+  const { data, error } = await supabase.from("fantasy_teams").select("*");
+  if (error) throw error;
+  return ((data ?? []) as DbTeam[]).map(rowToTeam);
 }
 
 export async function getAllTeamsForMajor(majorKey: MajorKey) {
-  const teams = await readAllTeams();
-  return teams.filter((t) => t.majorKey === majorKey);
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("fantasy_teams")
+    .select("*")
+    .eq("major_key", majorKey);
+  if (error) throw error;
+  return ((data ?? []) as DbTeam[]).map(rowToTeam);
 }
 
 export async function createTeamForUser(input: { userId: string; majorKey: MajorKey; name: string }) {
-  const teams = await readAllTeams();
-  const existing = teams.find((t) => t.userId === input.userId && t.majorKey === input.majorKey);
+  const supabase = getSupabase();
+  const { data: existing } = await supabase
+    .from("fantasy_teams")
+    .select("id")
+    .eq("user_id", input.userId)
+    .eq("major_key", input.majorKey)
+    .maybeSingle();
   if (existing) return { ok: false as const, error: "TEAM_ALREADY_EXISTS" as const };
 
-  const team: TeamRecord = {
+  const row = {
     id: crypto.randomUUID(),
-    userId: input.userId,
-    majorKey: input.majorKey,
+    user_id: input.userId,
+    major_key: input.majorKey,
     name: input.name,
     golfers: [],
-    captainRank: null,
+    captain_rank: null,
     substitute: null,
-    createdAt: new Date().toISOString(),
+    created_at: new Date().toISOString(),
   };
-  teams.push(team);
-  await writeAllTeams(teams);
-  return { ok: true as const, team };
+  const { data: inserted, error } = await supabase.from("fantasy_teams").insert(row).select("*").single();
+  if (error) throw error;
+  return { ok: true as const, team: rowToTeam(inserted as DbTeam) };
 }
 
 export async function saveSelectionForUser(input: {
@@ -103,18 +124,33 @@ export async function saveSelectionForUser(input: {
   golfers: { rank: number; name: string; playerId?: string }[];
   captainRank: number;
 }) {
-  const teams = await readAllTeams();
-  const idx = teams.findIndex((t) => t.userId === input.userId && t.majorKey === input.majorKey);
-  if (idx === -1) return { ok: false as const, error: "TEAM_NOT_FOUND" as const };
+  const supabase = getSupabase();
+  const { data: team, error: fetchError } = await supabase
+    .from("fantasy_teams")
+    .select("*")
+    .eq("user_id", input.userId)
+    .eq("major_key", input.majorKey)
+    .maybeSingle();
+  if (fetchError) throw fetchError;
+  if (!team) return { ok: false as const, error: "TEAM_NOT_FOUND" as const };
 
-  const team = teams[idx]!;
-  team.golfers = input.golfers;
-  team.captainRank = input.captainRank;
-  team.substitute = null;
-  teams[idx] = team;
+  const { error: updateError } = await supabase
+    .from("fantasy_teams")
+    .update({
+      golfers: input.golfers,
+      captain_rank: input.captainRank,
+      substitute: null,
+    })
+    .eq("id", (team as DbTeam).id);
+  if (updateError) throw updateError;
 
-  await writeAllTeams(teams);
-  return { ok: true as const, team };
+  const updated: TeamRecord = {
+    ...rowToTeam(team as DbTeam),
+    golfers: input.golfers,
+    captainRank: input.captainRank,
+    substitute: null,
+  };
+  return { ok: true as const, team: updated };
 }
 
 export async function setSubstituteForUserMajor(input: {
@@ -122,18 +158,32 @@ export async function setSubstituteForUserMajor(input: {
   majorKey: MajorKey;
   substitute: NonNullable<TeamRecord["substitute"]>;
 }) {
-  const teams = await readAllTeams();
-  const idx = teams.findIndex((t) => t.userId === input.userId && t.majorKey === input.majorKey);
-  if (idx === -1) return { ok: false as const, error: "TEAM_NOT_FOUND" as const };
+  const supabase = getSupabase();
+  const { data: team, error: fetchError } = await supabase
+    .from("fantasy_teams")
+    .select("*")
+    .eq("user_id", input.userId)
+    .eq("major_key", input.majorKey)
+    .maybeSingle();
+  if (fetchError) throw fetchError;
+  if (!team) return { ok: false as const, error: "TEAM_NOT_FOUND" as const };
 
-  const team = teams[idx]!;
-  team.substitute = input.substitute;
-  if (team.captainRank === input.substitute.outRank) {
-    team.captainRank = input.substitute.inRank;
+  const current = team as DbTeam;
+  let newCaptainRank = current.captain_rank;
+  if (current.captain_rank === input.substitute.outRank) {
+    newCaptainRank = input.substitute.inRank;
   }
-  teams[idx] = team;
 
-  await writeAllTeams(teams);
-  return { ok: true as const, team };
+  const { error: updateError } = await supabase
+    .from("fantasy_teams")
+    .update({ substitute: input.substitute, captain_rank: newCaptainRank })
+    .eq("id", current.id);
+  if (updateError) throw updateError;
+
+  const updated: TeamRecord = {
+    ...rowToTeam(current),
+    substitute: input.substitute,
+    captainRank: newCaptainRank,
+  };
+  return { ok: true as const, team: updated };
 }
-

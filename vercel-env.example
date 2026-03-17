@@ -1,0 +1,37 @@
+# Vercel Environment Variables
+# Copy this file, fill in real values, then in Vercel:
+# Project → Settings → Environment Variables → Import .env
+# Paste or upload your filled-in version (Production, Preview, Development as needed).
+# Do NOT commit the file with real secrets.
+
+# Required – use a long random string (e.g. openssl rand -base64 32)
+AUTH_SECRET=your-auth-secret-min-32-chars
+
+# Required – Supabase (Dashboard → Settings → API)
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+
+# Required for OWGR and leaderboards
+RAPIDAPI_KEY=your-rapidapi-key
+
+# Majors config
+MAJORS_YEAR=2024
+MAJORS_MASTERS_TOURN_ID=014
+MAJORS_PGA_TOURN_ID=
+MAJORS_USOPEN_TOURN_ID=
+MAJORS_OPEN_TOURN_ID=
+MAJORS_MASTERS_START_AT=2026-04-09T12:00:00Z
+MAJORS_PGA_START_AT=2026-05-14T12:00:00Z
+MAJORS_USOPEN_START_AT=2026-06-18T12:00:00Z
+MAJORS_OPEN_START_AT=2026-07-16T06:00:00Z
+MAJORS_IN_PROGRESS_WINDOW_HOURS=96
+
+# Optional – password reset and account-update emails (Gmail example)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_USER=goersgolf@gmail.com
+SMTP_PASS=your-gmail-app-password
+SMTP_FROM="Goers Golf <goersgolf@gmail.com>"
+
+# Production – set to your live URL so reset emails link correctly
+APP_BASE_URL=https://goersgolf.com

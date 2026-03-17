@@ -44,24 +44,36 @@ export async function POST(req: Request) {
     return badRequest("PASSWORD_LENGTH");
   }
 
-  const passwordHash = await hashPassword(password);
-  const created = await createUser({ username, passwordHash, email });
-  if (!created.ok) {
+  try {
+    const passwordHash = await hashPassword(password);
+    const created = await createUser({ username, passwordHash, email });
+    if (!created.ok) {
+      return NextResponse.json(
+        { ok: false, error: created.error },
+        { status: 409 },
+      );
+    }
+
+    const token = await signSession({ sub: created.user.id, username });
+    const res = NextResponse.json({ ok: true, user: { username } });
+    res.cookies.set(getSessionCookieName(), token, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      path: "/",
+      maxAge: 60 * 60 * 24 * 7,
+    });
+    return res;
+  } catch (err) {
+    console.error("[signup]", err);
+    const message =
+      err instanceof Error && err.message.includes("SUPABASE")
+        ? "SERVER_CONFIG"
+        : "SIGNUP_FAILED";
     return NextResponse.json(
-      { ok: false, error: created.error },
-      { status: 409 },
+      { ok: false, error: message },
+      { status: 500 },
     );
   }
-
-  const token = await signSession({ sub: created.user.id, username });
-  const res = NextResponse.json({ ok: true, user: { username } });
-  res.cookies.set(getSessionCookieName(), token, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    path: "/",
-    maxAge: 60 * 60 * 24 * 7,
-  });
-  return res;
 }
 

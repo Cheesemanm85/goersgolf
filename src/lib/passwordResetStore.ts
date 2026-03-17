@@ -1,6 +1,5 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
 import crypto from "node:crypto";
+import { getSupabase } from "@/lib/supabase";
 
 type ResetRecord = {
   id: string;
@@ -11,26 +10,24 @@ type ResetRecord = {
   usedAt?: string;
 };
 
-function filePath() {
-  return path.join(process.cwd(), "data", "passwordResets.json");
-}
+type DbReset = {
+  id: string;
+  user_id: string;
+  token_hash: string;
+  expires_at: string;
+  created_at: string;
+  used_at: string | null;
+};
 
-async function readAll(): Promise<ResetRecord[]> {
-  const file = filePath();
-  try {
-    const raw = await fs.readFile(file, "utf8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as ResetRecord[]) : [];
-  } catch (e: unknown) {
-    if (typeof e === "object" && e && "code" in e && e.code === "ENOENT") return [];
-    throw e;
-  }
-}
-
-async function writeAll(rows: ResetRecord[]) {
-  const file = filePath();
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(rows, null, 2) + "\n", "utf8");
+function rowToReset(r: DbReset): ResetRecord {
+  return {
+    id: r.id,
+    userId: r.user_id,
+    tokenHash: r.token_hash,
+    expiresAt: r.expires_at,
+    createdAt: r.created_at,
+    usedAt: r.used_at ?? undefined,
+  };
 }
 
 function sha256(input: string) {
@@ -42,34 +39,45 @@ export function generateResetToken() {
 }
 
 export async function createPasswordReset(input: { userId: string; token: string; ttlMinutes: number }) {
-  const rows = await readAll();
+  const supabase = getSupabase();
   const now = new Date();
   const expiresAt = new Date(now.getTime() + input.ttlMinutes * 60_000).toISOString();
 
-  const rec: ResetRecord = {
+  const row = {
     id: crypto.randomUUID(),
-    userId: input.userId,
-    tokenHash: sha256(input.token),
-    createdAt: now.toISOString(),
-    expiresAt,
+    user_id: input.userId,
+    token_hash: sha256(input.token),
+    expires_at: expiresAt,
+    created_at: now.toISOString(),
+    used_at: null,
   };
-  rows.push(rec);
-  await writeAll(rows);
-  return rec;
+  const { data, error } = await supabase.from("password_resets").insert(row).select("*").single();
+  if (error) throw error;
+  return rowToReset(data as DbReset);
 }
 
 export async function consumePasswordReset(input: { token: string }) {
-  const rows = await readAll();
+  const supabase = getSupabase();
   const tokenHash = sha256(input.token);
-  const idx = rows.findIndex((r) => r.tokenHash === tokenHash);
-  if (idx === -1) return { ok: false as const, error: "TOKEN_INVALID" as const };
 
-  const rec = rows[idx]!;
-  if (rec.usedAt) return { ok: false as const, error: "TOKEN_USED" as const };
-  if (new Date(rec.expiresAt).getTime() < Date.now()) return { ok: false as const, error: "TOKEN_EXPIRED" as const };
+  const { data: rows, error } = await supabase
+    .from("password_resets")
+    .select("*")
+    .eq("token_hash", tokenHash)
+    .limit(1);
+  if (error) throw error;
+  const rec = (rows ?? [])[0] as DbReset | undefined;
+  if (!rec) return { ok: false as const, error: "TOKEN_INVALID" as const };
+  if (rec.used_at) return { ok: false as const, error: "TOKEN_USED" as const };
+  if (new Date(rec.expires_at).getTime() < Date.now()) return { ok: false as const, error: "TOKEN_EXPIRED" as const };
 
-  rows[idx] = { ...rec, usedAt: new Date().toISOString() };
-  await writeAll(rows);
-  return { ok: true as const, reset: rows[idx]! };
+  const usedAt = new Date().toISOString();
+  const { data: updated, error: updateError } = await supabase
+    .from("password_resets")
+    .update({ used_at: usedAt })
+    .eq("id", rec.id)
+    .select("*")
+    .single();
+  if (updateError) throw updateError;
+  return { ok: true as const, reset: rowToReset({ ...updated, used_at: usedAt } as DbReset) };
 }
-
